@@ -115,9 +115,10 @@ def test_brightness_decays_monotonically_to_one_across_the_hysteresis_band(
 ):
     """No cliff at the old minimum_luminance boundary.
 
-    Old code gave 34/0/0 at 99/100/101 lux (the 0s from the negative term
-    clamping once luminance passed the bare minimum). Dividing by the widened
-    150 threshold instead, the level decays smoothly to 34/34/33.
+    Old code gave 2/0/0 at 99/100/101 lux (fp ceil at 99; the 0s once
+    luminance reached the bare minimum, where the term hits zero then goes
+    negative). Dividing by the widened 150 threshold instead, the level
+    decays smoothly to 34/34/33 — no cliff.
     """
     import indigo
     data, cfg = load_scenario(

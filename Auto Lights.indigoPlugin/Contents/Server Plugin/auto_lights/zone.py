@@ -1066,7 +1066,7 @@ class Zone(AutoLightsBase):
         value: printing the bare minimum next to a `is dark = True` computed
         from the widened one reads as a bug. It is also the divisor for the
         adjust_brightness calculation, so the computed level stays positive
-        and continuous inside the band.
+        and continuous for the whole time the zone is dark, band included.
         """
         if self._is_dark_state:
             return self.minimum_luminance + self.luminance_hysteresis
@@ -1525,15 +1525,19 @@ class Zone(AutoLightsBase):
                     # can sit above minimum_luminance, and dividing by the
                     # minimum made this term negative (e.g. 2600/2500 -> -4),
                     # clamping to 0 and turning dimmers OFF in the branch whose
-                    # plan says "turning on lights" (issue #7). Here is_dark()
-                    # has just returned True from a real reading, so the
-                    # effective threshold is minimum + hysteresis and
+                    # plan says "turning on lights" (issue #7). On a real
+                    # reading, is_dark() has just latched the dark state, so
+                    # the effective threshold is minimum + hysteresis and
                     # luminance < threshold strictly: the term is positive and
-                    # ceil() yields at least 1. With hysteresis 0 the divisor
-                    # is the bare minimum, so behaviour there is unchanged.
-                    # The clamp is kept as defence-in-depth for readings that
-                    # move between is_dark() and this line (variable-backed
-                    # thresholds re-read Indigo on every access).
+                    # ceil() yields at least 1. On the sensorless and
+                    # unreadable-hold paths there is no current reading;
+                    # luminance reads 0 there, so the term stays positive too
+                    # (or the <= 0 guard below applies). With hysteresis 0 the
+                    # divisor is the bare minimum, so behaviour is unchanged.
+                    # The clamp is kept as defence-in-depth: both inputs can
+                    # move between is_dark() and this line — the luminance
+                    # property re-reads the sensors, and a variable-backed
+                    # minimum re-reads Indigo, on every access.
                     threshold = self.effective_darkness_threshold
                     if threshold <= 0:
                         # A zero/negative threshold cannot express "fraction of

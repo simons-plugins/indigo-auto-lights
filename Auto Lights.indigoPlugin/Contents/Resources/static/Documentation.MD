@@ -128,8 +128,9 @@ Luminance, if provided, is used in a number of ways:
 3. **Adjust Dimmer Brightness**: If turned on, the brightness of a dimmer device will be set to:
     - [1 - (current luminance / darkness threshold)] x 100
 
-   The darkness threshold is Minimum Luminance; while Luminance Hysteresis is holding the Zone dark it is Minimum
-   Luminance + Luminance Hysteresis, so the computed level stays above zero and decays smoothly across the band.
+   The darkness threshold is Minimum Luminance + Luminance Hysteresis whenever the Zone is dark (Minimum Luminance
+   alone when hysteresis is 0), so the computed level stays above zero and decays smoothly across the band. Enabling
+   hysteresis therefore raises the computed level at every luminance while dark, not only inside the band.
 
 > **NOTE:** If you provide more than one Luminance device, the current luminance is calculated as the average across all
 > sensors.
@@ -157,7 +158,8 @@ the Zone reaches `3000`.
 
 When **Adjust Dimmer Brightness** is on, the brightness calculation divides by this same widened threshold, so inside
 the band the level tapers toward 1% rather than snapping to off; the lights only turn off once the Zone leaves the
-band.
+band. The widened threshold applies for as long as the Zone is dark, not only inside the band, so turning on
+hysteresis also raises the computed level at readings well below Minimum Luminance.
 
 > **NOTE:** Set the value wider than your lights' own contribution at the sensor, or the loop will still ring. Measure
 > it by reading the sensor with the Zone's lights off and then at full brightness, after dark, and take the difference.
