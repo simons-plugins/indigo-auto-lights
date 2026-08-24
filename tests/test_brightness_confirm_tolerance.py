@@ -1,9 +1,18 @@
-"""Tests for the ±1 brightness confirmation tolerance (issue #2).
+"""Tests for the proportional brightness confirmation tolerance.
 
 Device plugins that carry level in a native non-percentage range scale a
 commanded percentage out and back and truncate in both directions, so a
 device commanded to 30% honestly reports 29%. Confirming on exact
-equality suppressed healthy hardware for the life of the lighting period.
+equality suppressed healthy hardware for the life of the lighting period
+(issue #2).
+
+A flat ±1 band (the original fix) was still too tight for real hardware:
+2026-08-24 jarvis logs showed zigbee2mqtt dimmers — and one z2m *group*
+dimmer in particular, whose reported brightness derives from member lamps
+that settle slightly differently — reporting several points low of a
+commanded level, with the gap scaling with the target (10->1, 30->2,
+50->2..5). The tolerance is now proportional: `max(floor, ceil(target *
+fraction))`, floor 1, fraction 10%.
 """
 
 import json
@@ -70,10 +79,56 @@ def test_stuck_device_still_fails():
     assert utils._check_confirm(dev, 30, None) is False
 
 
-def test_two_points_off_still_fails():
-    """The band is 1 — anything wider would start hiding real failures."""
-    dev = make_device(806, brightness=28)
-    assert utils._check_confirm(dev, 30, None) is False
+def test_two_points_off_still_fails_at_a_low_target():
+    """At target 10 the band is still the floor (1) — 2 off still fails."""
+    dev = make_device(806, brightness=8)
+    assert utils._check_confirm(dev, 10, None) is False
+
+
+# --- the 2026-08-24 jarvis findings: proportional band ---
+
+
+@pytest.mark.parametrize(
+    "target,reported",
+    [
+        (10, 9),  # already absorbed by the flat band; must keep working
+        (30, 28),
+        (50, 48),
+        (50, 47),
+        (50, 45),  # boundary: gap 5 == band for target 50
+    ],
+)
+def test_real_observed_pairs_are_absorbed(target, reported):
+    """Real (target, reported) pairs pulled from production jarvis logs
+    2026-08-24, dominated by a zigbee2mqtt group dimmer whose readback
+    varies cycle to cycle for the same commanded level."""
+    dev = make_device(809, brightness=reported)
+    assert utils._check_confirm(dev, target, None) is True
+
+
+@pytest.mark.parametrize(
+    "target,reported",
+    [
+        (40, 49),  # gap 9 > band 4 — genuine external change, must still lock
+        (30, 49),  # gap 19 > band 3 — genuine external change, must still lock
+    ],
+)
+def test_real_observed_pairs_still_lock(target, reported):
+    """Both genuine external changes observed in the same logs were
+    upward and larger than the proportional band; they must still read
+    as a mismatch so the zone locks."""
+    dev = make_device(810, brightness=reported)
+    assert utils._check_confirm(dev, target, None) is False
+
+
+def test_dead_light_reporting_zero_is_not_masked():
+    """A device that reports 0 when commanded to a mid-range target is a
+    malfunctioning light, not settle noise. The proportional band must
+    not be wide enough to swallow it: max(1, ceil(40*0.1)) = 4, and a gap
+    of 40 is nowhere near that. Silently absorbing a dead light would be
+    the worst possible regression of this fix."""
+    dev = make_device(811, brightness=0)
+    assert utils._check_confirm(dev, 40, None) is False
 
 
 def test_relay_is_unaffected():
@@ -143,6 +198,29 @@ def test_zone_still_sees_a_genuinely_stuck_dimmer(agent_and_zone):
     agent, zone = agent_and_zone
     dev_id = zone.on_lights_dev_ids[0]
     make_device(dev_id, brightness=0, onState=False)
+    zone.target_brightness = [{"dev_id": dev_id, "brightness": 30}]
+
+    assert zone.has_brightness_changes() is True
+
+
+def test_zone_absorbs_a_group_dimmer_two_points_low(agent_and_zone):
+    """Reproduces the production symptom: a z2m group dimmer commanded to
+    30 reads back 28. Under the old flat band this locked the zone every
+    cycle; the proportional band (target 30 -> band 3) absorbs it."""
+    agent, zone = agent_and_zone
+    dev_id = zone.on_lights_dev_ids[0]
+    make_device(dev_id, brightness=28, onState=True)
+    zone.target_brightness = [{"dev_id": dev_id, "brightness": 30}]
+
+    assert zone.has_brightness_changes() is False
+
+
+def test_zone_still_locks_on_a_genuine_external_raise(agent_and_zone):
+    """A device reporting far above its target (someone raised it by hand)
+    must still register as a change and be able to lock the zone."""
+    agent, zone = agent_and_zone
+    dev_id = zone.on_lights_dev_ids[0]
+    make_device(dev_id, brightness=49, onState=True)
     zone.target_brightness = [{"dev_id": dev_id, "brightness": 30}]
 
     assert zone.has_brightness_changes() is True
