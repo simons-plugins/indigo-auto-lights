@@ -13,6 +13,7 @@ a consistent interface for controlling different types of Indigo devices.
 """
 
 import logging
+import math
 import time
 
 try:
@@ -28,10 +29,25 @@ logger = logging.getLogger("Plugin")
 # commanded percentage out and back, and several truncate in both directions
 # (zigbee2mqtt: 30% -> int(76.5)=76 -> int(29.8)=29). Confirming on exact
 # equality then never succeeds for 95 of the 101 percentages, so healthy
-# hardware gets suppressed for the life of the lighting period. A band of 1
+# hardware gets suppressed for the life of the lighting period. A floor of 1
 # absorbs a 0-254 or 0-99 round trip and is smaller than any meaningful
 # brightness step, so genuine failures still fail.
-BRIGHTNESS_CONFIRM_TOLERANCE = 1
+#
+# 2026-08-24, live jarvis logs: a flat band of 1 was still too tight. Real
+# zigbee2mqtt dimmers were reporting back several points low of a commanded
+# level — (30, 28), (50, 45..48) — and each miss locked the zone out of
+# automation. The gap scales with the target (10->1, 30->2, 50->2..5), so a
+# flat number can't fit it; the fix is proportional, floored at the same 1.
+# The worst offender was a z2m *group* device (a "Zigbee Group Dimmer"
+# aggregating several physical lamps): its reported brightness derives from
+# members that settle slightly differently, so the same commanded level read
+# back 48, 47 or 45 on different cycles — not deterministic quantization, and
+# not mid-fade sampling (the comparison runs ~8ms after the target is
+# computed, against the previous cycle's settled value). The slop was always
+# downward; two genuine external changes in the same logs (40->49, 30->49)
+# were both upward and must still lock the zone.
+BRIGHTNESS_CONFIRM_TOLERANCE_FLOOR = 1
+BRIGHTNESS_CONFIRM_TOLERANCE_FRACTION = 0.10
 
 
 def _brightness_matches(actual, target_level) -> bool:
@@ -39,13 +55,18 @@ def _brightness_matches(actual, target_level) -> bool:
 
     Off (0) and full (100) compare exactly: "off" must never mean "nearly
     off", and a light that failed to switch must still read as a failure.
-    Only intermediate targets get the tolerance band.
+    Only intermediate targets get the tolerance band, which scales with the
+    target (10% of it) and is never narrower than the floor above.
     """
     actual = int(actual)
     target_level = int(target_level)
     if target_level <= 0 or target_level >= 100:
         return actual == target_level
-    return abs(actual - target_level) <= BRIGHTNESS_CONFIRM_TOLERANCE
+    band = max(
+        BRIGHTNESS_CONFIRM_TOLERANCE_FLOOR,
+        math.ceil(target_level * BRIGHTNESS_CONFIRM_TOLERANCE_FRACTION),
+    )
+    return abs(actual - target_level) <= band
 
 
 class PerfClock:
