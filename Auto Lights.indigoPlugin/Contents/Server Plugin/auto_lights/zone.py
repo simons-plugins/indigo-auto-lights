@@ -2054,15 +2054,60 @@ class Zone(AutoLightsBase):
 
         return ";".join(lines)
 
-    def has_lock_occurred(self) -> bool:
-        """Determine if an external change should create a new zone lock."""
+    def has_lock_occurred(self, changed_dev=None) -> bool:
+        """Determine if an external change should create a new zone lock.
+
+        Args:
+            changed_dev: the device as it was AT THE MOMENT OF THE EVENT, from
+                the deviceUpdated callback. Optional, but without it this check
+                is racy — see below.
+        """
         # if we’re in the middle of our own process_zone run, don’t treat our device writes as
         # an external change that should create a new lock.
         if self.checked_out:
             return False
 
         result = self.has_brightness_changes(exclude_lock_devices=True)
+
+        if not result and changed_dev is not None:
+            # has_brightness_changes() re-reads LIVE device state. In a busy zone
+            # a concurrent process_zone run (presence or luminance) can revert
+            # the manual change before we get here, so the live read says
+            # "at target" and the override becomes invisible — it erases its own
+            # evidence and no lock is created. Judge the event's own snapshot,
+            # which cannot be overwritten by a later revert.
+            result = self._change_diverges_from_target(changed_dev)
+
         self._debug_log(f"has_lock_occurred result: {result}")
         if self.locked != result:
             self.locked = result
         return result
+
+    def _change_diverges_from_target(self, changed_dev) -> bool:
+        """Did this device-change event itself move the device off its target?
+
+        Uses the same is_device_at_target() predicate as has_brightness_changes()
+        so both agree on what "at target" means, but evaluates it against the
+        device snapshot carried by the event rather than a fresh live read.
+        """
+        if not self.enabled or not self.target_brightness:
+            return False
+
+        dev_id = changed_dev.id
+        if dev_id in self.exclude_from_lock_dev_ids:
+            return False
+        if self._is_device_suppressed(dev_id):
+            return False
+
+        for tgt in self.target_brightness:
+            if tgt["dev_id"] != dev_id:
+                continue
+            desired = tgt["brightness"]
+            at_target = utils.is_device_at_target(changed_dev, desired)
+            self._debug_log(
+                f"change-based lock check: device {dev_id}: desired={desired}, "
+                f"at_target(event snapshot)={at_target}"
+            )
+            return not at_target
+
+        return False

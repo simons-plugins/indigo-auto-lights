@@ -208,7 +208,11 @@ class AutoLightsAgent(AutoLightsBase):
                     )
                     continue
 
-                if zone.lock_enabled and not zone.locked and zone.has_lock_occurred():
+                if (
+                    zone.lock_enabled
+                    and not zone.locked
+                    and zone.has_lock_occurred(current_dev)
+                ):
                     prior_dev = previous_dev or current_dev
                     change_info = ""
                     if "brightness" in diff:
