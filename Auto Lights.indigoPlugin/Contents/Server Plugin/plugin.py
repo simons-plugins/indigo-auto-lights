@@ -54,7 +54,7 @@ class Plugin(indigo.PluginBase):
         self.log_level = int(plugin_prefs.get("log_level", logging.INFO))
         self.logger.debug(f"{self.log_level=}")
         self.indigo_log_handler.setLevel(self.log_level)
-        self.plugin_file_handler.setLevel(logging.DEBUG)
+        self.plugin_file_handler.setLevel(self.log_level)
 
         # Determine configuration file path based on plugin log file location.
         self._config_file_str = self.plugin_file_handler.baseFilename.replace(
