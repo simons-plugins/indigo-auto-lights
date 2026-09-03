@@ -19,6 +19,28 @@ except ImportError:
 LOCK_EXPIRY_GRACE_SECONDS = 2
 
 
+def _presence_reading(dev) -> tuple:
+    """The part of a presence device that Zone.has_presence_detected() reads.
+
+    Mirrors that method exactly: it consults states["onState"] and
+    states["onOffState"], and the onState attribute is included because the
+    stub/real Device objects expose it alongside the states mapping. A device
+    with no states mapping at all is treated as an empty one rather than
+    raising — an unreadable snapshot must not take the callback thread down.
+    """
+    states = getattr(dev, "states", None) or {}
+    return (
+        getattr(dev, "onState", None),
+        states.get("onState"),
+        states.get("onOffState"),
+    )
+
+
+def _luminance_reading(dev):
+    """The part of a luminance device that Zone._read_luminance_values() reads."""
+    return getattr(dev, "sensorValue", None)
+
+
 class AutoLightsAgent(AutoLightsBase):
     def __init__(self, config: AutoLightsConfig) -> None:
         super().__init__()
@@ -181,7 +203,10 @@ class AutoLightsAgent(AutoLightsBase):
               - An event with no previous state (previous_dev is None) is not
                 judged at all: no lock.
           - If the property is 'presence_dev_ids' or 'luminance_dev_ids':
-              - Process the change by calling self.process_zone(zone)
+              - Re-evaluate the zone only if the device's presence (on/off) or
+                luminance (sensorValue) reading actually changed; any other
+                update to that device (display text, timers, comm timestamps)
+                is ignored.
 
         Returns:
             List[Zone]: List of Zone's processed
@@ -254,6 +279,41 @@ class AutoLightsAgent(AutoLightsBase):
                     # Arm the single lock-expiry timer for this zone.
                     self._schedule_lock_check(zone)
             elif device_prop in ["presence_dev_ids", "luminance_dev_ids"]:
+                # Re-evaluate only when the reading this zone actually consumes
+                # has changed. An Occupatum occupancy device used as a presence
+                # sensor updates a delay_timer state and its display string
+                # every ~1.2s while its off-delay counts down, and again on
+                # every re-trip; re-planning the zone on each of those re-applied
+                # period levels about once a second, reverting the user's manual
+                # dimmer change within a second, and the load on the callback
+                # thread delayed the light's own change notification by ~10s —
+                # all while neither presence on/off nor the light sensor value
+                # had moved. The comparison reads the two snapshots directly
+                # rather than the keys of `diff`, so it mirrors what the zone
+                # reads instead of what the device happened to report.
+                #
+                # With no previous snapshot there is nothing to compare, so the
+                # gate does not apply: silently skipping re-evaluation there
+                # would be a lights-never-respond failure.
+                if previous_dev is not None:
+                    if device_prop == "presence_dev_ids":
+                        unchanged = _presence_reading(
+                            previous_dev
+                        ) == _presence_reading(current_dev)
+                        reading = "presence"
+                    else:
+                        unchanged = _luminance_reading(
+                            previous_dev
+                        ) == _luminance_reading(current_dev)
+                        reading = "luminance"
+                    if unchanged:
+                        self._debug_log(
+                            f"Update from '{current_dev.name}' carried no change to "
+                            f"its {reading} reading; not re-evaluating zone "
+                            f"'{zone.name}'"
+                        )
+                        continue
+
                 # Invalidate the corresponding runtime cache so the next
                 # process_zone reads fresh sensor state. Without this, a
                 # luminance update could re-evaluate against a stale is_dark
