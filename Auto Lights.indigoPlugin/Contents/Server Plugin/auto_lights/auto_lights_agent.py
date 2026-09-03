@@ -170,10 +170,16 @@ class AutoLightsAgent(AutoLightsBase):
         Process a device change event.
 
         For each zone in the agent:
-          - Call zone.has_device(orig_dev.id)
+          - Call zone._has_device(current_dev.id)
           - If the returned property is 'on_lights_dev_ids' or 'off_lights_dev_ids':
-              - If the zone's current_lights_status does not equal its target_brightness,
-                set zone.locked to True.
+              - Ask zone.has_lock_occurred(previous_dev, current_dev), which
+                locks the zone only when THIS device went from at-target to
+                off-target across this one event. It never re-reads live state
+                and never looks at the zone's other devices, so the plugin's
+                own writes (always issued to an off-target device) cannot
+                self-lock, and a concurrent revert cannot erase the evidence.
+              - An event with no previous state (previous_dev is None) is not
+                judged at all: no lock.
           - If the property is 'presence_dev_ids' or 'luminance_dev_ids':
               - Process the change by calling self.process_zone(zone)
 
@@ -208,20 +214,21 @@ class AutoLightsAgent(AutoLightsBase):
                     )
                     continue
 
-                if zone.lock_enabled and not zone.locked and zone.has_lock_occurred():
-                    prior_dev = previous_dev or current_dev
+                if (
+                    zone.lock_enabled
+                    and not zone.locked
+                    and zone.has_lock_occurred(previous_dev, current_dev)
+                ):
+                    # has_lock_occurred() only returns True after comparing a
+                    # real previous_dev, so it is never None here.
                     change_info = ""
                     if "brightness" in diff:
-                        old = getattr(prior_dev, "brightness", None)
-                        new = diff["brightness"]
+                        old = getattr(previous_dev, "brightness", None)
+                        new = getattr(current_dev, "brightness", None)
                         change_info = f" (was: {old}; now: {new})"
-                    elif "onState" in diff:
-                        old = prior_dev.states.get("onState", False)
-                        new = diff["onState"]
-                        change_info = f" (was: {old}; now: {new})"
-                    elif "onOffState" in diff:
-                        old = prior_dev.states.get("onOffState", False)
-                        new = diff["onOffState"]
+                    elif "onState" in diff or "onOffState" in diff:
+                        old = getattr(previous_dev, "onState", None)
+                        new = getattr(current_dev, "onState", None)
                         change_info = f" (was: {old}; now: {new})"
                     self.logger.info(
                         f"🔒 New lock created for zone '{zone.name}'; device change from '{current_dev.name}'{change_info}."

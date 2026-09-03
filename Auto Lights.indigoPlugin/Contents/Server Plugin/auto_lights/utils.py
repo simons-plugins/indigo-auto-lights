@@ -119,12 +119,18 @@ def _check_confirm(device, target_level, target_bool) -> bool:
     return result
 
 
-def is_device_at_target(device, desired_brightness) -> bool:
+def device_at_target_or_raise(device, desired_brightness) -> bool:
     """Return True if the given device is currently at the desired target.
 
     Accepts the same shape as the entries stored in zone.target_brightness
     (an int 0..100 or a bool). Wraps _check_confirm so callers don't have
     to translate between the int/bool target representations themselves.
+
+    Propagates any exception raised while reading the device. Callers that
+    only want a display-grade answer should use is_device_at_target();
+    callers whose *decision* hinges on the answer must use this one, so a
+    device they cannot evaluate is a visible failure rather than a silent
+    "not at target".
     """
     if isinstance(desired_brightness, bool):
         target_level = 100 if desired_brightness else 0
@@ -132,8 +138,17 @@ def is_device_at_target(device, desired_brightness) -> bool:
     else:
         target_level = int(desired_brightness)
         target_bool = None
+    return _check_confirm(device, target_level, target_bool)
+
+
+def is_device_at_target(device, desired_brightness) -> bool:
+    """Best-effort variant of device_at_target_or_raise().
+
+    A device that cannot be read at all is reported as "not at target",
+    which for the send path means "command it" — the safe direction there.
+    """
     try:
-        return _check_confirm(device, target_level, target_bool)
+        return device_at_target_or_raise(device, desired_brightness)
     except Exception:
         return False
 

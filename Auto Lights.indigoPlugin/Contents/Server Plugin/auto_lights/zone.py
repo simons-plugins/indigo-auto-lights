@@ -2054,15 +2054,105 @@ class Zone(AutoLightsBase):
 
         return ";".join(lines)
 
-    def has_lock_occurred(self) -> bool:
-        """Determine if an external change should create a new zone lock."""
-        # if we’re in the middle of our own process_zone run, don’t treat our device writes as
-        # an external change that should create a new lock.
-        if self.checked_out:
+    def has_lock_occurred(self, previous_dev, current_dev) -> bool:
+        """Decide whether ONE device-change event is a manual override.
+
+        The rule is a transition on the device the event is about: the state
+        BEFORE the change (Indigo's ``origDev``) was at target and the state
+        AFTER the change is not. Nothing else is consulted — no live re-read
+        of the device, and no scan of the other devices in the zone.
+
+        Why this cannot fire on Auto Lights' own writes: the plugin only ever
+        commands a device that is NOT at target (``save_brightness_changes``
+        skips at-target devices and ``send_to_indigo`` pre-checks again), so
+        every echo of our own command — the first report, each intermediate
+        step of a dimmer ramp, the final value, and any late straggler — has
+        a previous state that is off-target, and condition 2 fails.
+
+        Why it survives a concurrent revert: the evidence is the orig/new pair
+        Indigo handed us. A ``process_zone`` running in another thread can put
+        the device back before this callback gets to look, but it cannot
+        rewrite the snapshot pair, so the override is still visible.
+
+        The old implementation asked ``has_brightness_changes()`` — a
+        whole-zone LIVE read of "is anything off target right now?" — which
+        was wrong in both directions: a concurrent revert made a genuine
+        override invisible, and any event at all while some OTHER device was
+        still ramping or reporting late locked the zone.
+
+        The former ``if self.checked_out: return False`` early return is gone.
+        It existed to stop our own write burst from self-locking, which the
+        transition rule now handles by construction; meanwhile it was
+        discarding genuine manual changes that happened to arrive while the
+        zone was checked out — exactly when a user is most likely to reach
+        for a switch, since the lights are visibly moving.
+        """
+        if previous_dev is None:
+            self._debug_log(
+                f"has_lock_occurred: no previous state for device "
+                f"{getattr(current_dev, 'id', 'unknown')} "
+                f"('{getattr(current_dev, 'name', 'unknown')}'); the transition "
+                f"cannot be judged, so no lock is created"
+            )
             return False
 
-        result = self.has_brightness_changes(exclude_lock_devices=True)
+        result = self._is_external_change(previous_dev, current_dev)
         self._debug_log(f"has_lock_occurred result: {result}")
         if self.locked != result:
             self.locked = result
         return result
+
+    def _is_external_change(self, previous_dev, current_dev) -> bool:
+        """Return True if this event moved the device OFF its target.
+
+        Per event, per device: the device must have a target in this zone, not
+        be excluded from locking, and not be suppressed; then the transition
+        must be at-target → not-at-target.
+        """
+        if not self.enabled or not self.target_brightness:
+            self._debug_log(
+                "_is_external_change: zone disabled or no target brightness"
+            )
+            return False
+
+        dev_id = current_dev.id
+
+        if dev_id in self.exclude_from_lock_dev_ids:
+            self._debug_log(
+                f"_is_external_change: device {dev_id} is excluded from lock detection"
+            )
+            return False
+
+        if self._is_device_suppressed(dev_id):
+            self._debug_log(f"_is_external_change: device {dev_id} is suppressed")
+            return False
+
+        desired = None
+        for tgt in self.target_brightness:
+            if tgt["dev_id"] == dev_id:
+                desired = tgt["brightness"]
+                break
+        if desired is None:
+            self._debug_log(
+                f"_is_external_change: no target recorded for device {dev_id}"
+            )
+            return False
+
+        try:
+            was_at_target = utils.device_at_target_or_raise(previous_dev, desired)
+            now_at_target = utils.device_at_target_or_raise(current_dev, desired)
+        except Exception as e:
+            # Degradation path: a device whose state we cannot read must say
+            # so, not quietly become a device that can never lock its zone.
+            self.logger.warning(
+                f"Zone '{self._name}': cannot judge the change from "
+                f"'{getattr(current_dev, 'name', dev_id)}' against target "
+                f"{desired} ({e!r}); no lock created"
+            )
+            return False
+
+        self._debug_log(
+            f"_is_external_change: device {dev_id}: desired={desired}, "
+            f"was_at_target={was_at_target}, now_at_target={now_at_target}"
+        )
+        return was_at_target and not now_at_target
