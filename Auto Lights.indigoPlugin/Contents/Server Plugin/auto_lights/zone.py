@@ -60,13 +60,15 @@ MAX_CONSECUTIVE_FAILURES = 3
 MAX_REEVAL_BURST = 5
 REEVAL_WINDOW_SECONDS = 30.0
 
-# How long after we command a device that a report landing on the commanded
-# value is still treated as our own echo rather than a manual override. The
-# lock rule normally tells the two apart from the previous state alone, but a
-# re-plan between the command and its echo can move the target back onto the
-# value the device was at before, which makes our own echo look like a manual
-# move away from the new target.
-COMMAND_ECHO_WINDOW_SECONDS = 120
+# How long a device's pre-command state stays on record as an excuse for a
+# transition that starts from it. The window only has to cover the queued-echo
+# race — the echo of our command being delivered after a re-plan has already
+# put the target back onto the value the device was at when we commanded it —
+# which is bounded by send_to_indigo()'s 2s confirmation settle plus callback
+# latency. A long window would excuse real people: every second of it is a
+# second in which a genuine manual move away from that same state is read as
+# ours and missed.
+COMMAND_ECHO_WINDOW_SECONDS = 15
 
 # How long is_dark() may keep reporting the last real darkness decision while
 # the zone's luminance sensors are unreadable. Holding is a bridge across a
@@ -253,10 +255,14 @@ class Zone(AutoLightsBase):
         self._pending_writes = 0
         self._write_lock = threading.Lock()
 
-        # Recent commands per device, newest last, guarded by _write_lock.
-        # Lets the lock rule recognise an echo of our own write even when the
-        # target has since moved back onto the device's pre-command value.
+        # Per device, the states we recently commanded the device AWAY from,
+        # newest last. Lets the lock rule recognise an echo of our own write
+        # even when the target has since moved back onto the device's
+        # pre-command value. Guarded by its own lock rather than _write_lock:
+        # the Indigo callback thread reads this on every device event and must
+        # not queue behind the writer threads' pending-write bookkeeping.
         self._recent_commands: dict[int, Deque[Tuple[Union[int, bool], float]]] = {}
+        self._recent_commands_lock = threading.Lock()
 
         # Sliding window of writer-thread re-eval timestamps (monotonic).
         # Guarded by _reeval_lock; only touched from save_brightness_changes
@@ -1327,13 +1333,14 @@ class Zone(AutoLightsBase):
                 )
                 should_process = False
                 try:
-                    # Remember the value before it is sent, so an echo that
-                    # arrives after a re-plan moved the target back can still
-                    # be recognised as ours. The SuppressionManager's retry
-                    # path deliberately does NOT record: a suppressed device is
-                    # excluded from the lock rule anyway, so its retries can
-                    # never reach this check.
-                    self._note_command(dev_id, desired_brightness)
+                    # Remember the state the device is in before the command is
+                    # sent, so an echo that arrives after a re-plan moved the
+                    # target back onto that state can still be recognised as
+                    # ours. The SuppressionManager's retry path deliberately
+                    # does NOT record: a suppressed device is excluded from the
+                    # lock rule anyway, so its retries can never reach this
+                    # check.
+                    self._note_command(dev_id)
                     confirmed = utils.send_to_indigo(
                         dev_id, desired_brightness, clock=clock
                     )
@@ -2092,9 +2099,10 @@ class Zone(AutoLightsBase):
         first report, intermediate ramp step, final value, late straggler —
         has an off-target previous state. AND, because a re-plan between the
         command and its echo can put the target back onto the device's
-        pre-command value, an echo landing on a value we commanded within
-        ``COMMAND_ECHO_WINDOW_SECONDS`` is excused even when the transition
-        does read as at-target → off-target.
+        pre-command state, a transition whose STARTING point is a state we
+        commanded the device away from within ``COMMAND_ECHO_WINDOW_SECONDS``
+        is excused even when it does read as at-target → off-target. Each
+        recorded command excuses one such transition and is then consumed.
 
         This method has a side effect: when it returns True it sets
         ``self.locked``. It never clears a lock.
@@ -2119,38 +2127,68 @@ class Zone(AutoLightsBase):
             self.locked = True
         return result
 
-    def _note_command(self, dev_id: int, desired: Union[int, bool]) -> None:
-        """Record that we just commanded `dev_id` to `desired`.
+    def _note_command(self, dev_id: int) -> None:
+        """Record the state `dev_id` is in as we command it away from that state.
 
-        Only the last few values per device are kept; a burst longer than that
+        It is the PRE-command state that identifies the echo, not the value we
+        asked for: the echo we have to excuse is the device's own report of
+        leaving that state, and a dimmer reports it one ramp step at a time, on
+        none of which does it read back the value we commanded.
+
+        Only the last few states per device are kept; a burst longer than that
         is a ramp, whose intermediate steps the transition rule already
         excuses because the previous state was off-target.
+
+        This is bookkeeping, and bookkeeping must never cost a command: the
+        caller runs inside the writer's try/except, so a read that raised here
+        would abandon the send and be recorded as a device failure. A device we
+        cannot read simply gets no record, and its echoes fall back to the
+        transition rule alone — stricter, not blinder.
         """
-        with self._write_lock:
+        try:
+            pre = self._normalize_dev_target_brightness(dev_id)
+        except Exception:
+            self.logger.exception(
+                f"Zone '{self._name}': cannot read device {dev_id} to record "
+                f"the state it is being commanded away from. The command is "
+                f"still sent, but a delayed echo of it may be read as a manual "
+                f"override and lock this zone"
+            )
+            return
+        with self._recent_commands_lock:
             history = self._recent_commands.get(dev_id)
             if history is None:
                 history = deque(maxlen=4)
                 self._recent_commands[dev_id] = history
-            history.append((desired, time.monotonic()))
+            history.append((pre, time.monotonic()))
 
-    def _matches_recent_command(self, dev_id: int, current_dev) -> bool:
-        """Return True if this report lands on a value we recently commanded.
+    def _echo_of_recent_command(self, dev_id: int, previous_dev) -> Optional[float]:
+        """Age of the command this transition is the echo of, or None.
 
-        Prunes entries older than COMMAND_ECHO_WINDOW_SECONDS as it goes, so
-        the history cannot make an old command excuse a new manual change.
+        A match means the transition STARTED from a state we commanded the
+        device away from inside the window — which is what our own delayed
+        report looks like once a re-plan has moved the target back onto that
+        same state.
+
+        The matched record is consumed: one command excuses one transition. A
+        record left in place would excuse the same manual change over and over
+        (the zone re-plans the light back on, the user switches it off again,
+        and every attempt is read as our echo). Prunes entries older than
+        COMMAND_ECHO_WINDOW_SECONDS as it goes.
         """
-        cutoff = time.monotonic() - COMMAND_ECHO_WINDOW_SECONDS
-        with self._write_lock:
+        now = time.monotonic()
+        cutoff = now - COMMAND_ECHO_WINDOW_SECONDS
+        with self._recent_commands_lock:
             history = self._recent_commands.get(dev_id)
             if not history:
-                return False
+                return None
             while history and history[0][1] < cutoff:
                 history.popleft()
-            recent = list(history)
-        for value, _ts in recent:
-            if utils.device_at_target_or_raise(current_dev, value):
-                return True
-        return False
+            for index, (pre, ts) in enumerate(history):
+                if utils.device_at_target_or_raise(previous_dev, pre):
+                    del history[index]
+                    return now - ts
+        return None
 
     def _is_external_change(self, previous_dev, current_dev) -> bool:
         """Return True if this event moved the device OFF its target.
@@ -2207,18 +2245,16 @@ class Zone(AutoLightsBase):
         try:
             was_at_target = utils.device_at_target_or_raise(previous_dev, desired)
             now_at_target = utils.device_at_target_or_raise(current_dev, desired)
-            if (
-                was_at_target
-                and not now_at_target
-                and self._matches_recent_command(dev_id, current_dev)
-            ):
-                self._debug_log(
-                    f"_is_external_change: device {dev_id} reported a value we "
-                    f"commanded within the last {COMMAND_ECHO_WINDOW_SECONDS}s, "
-                    f"so this is our own echo arriving after the target moved "
-                    f"back to {desired}; no lock"
-                )
-                return False
+            if was_at_target and not now_at_target:
+                echo_age = self._echo_of_recent_command(dev_id, previous_dev)
+                if echo_age is not None:
+                    self._debug_log(
+                        f"_is_external_change: device {dev_id} moved off a "
+                        f"state we commanded it away from {echo_age:.1f}s ago, "
+                        f"so this is the echo of that command arriving after "
+                        f"the target moved back to {desired}; no lock"
+                    )
+                    return False
         except Exception as e:
             # Degradation path: a device whose state we cannot read must say
             # so, not quietly become a device that can never lock its zone.

@@ -97,6 +97,19 @@ class PerfClock:
 _unconfirmable_device_ids: set = set()
 
 
+def reset_confirm_warnings() -> None:
+    """Forget which devices have already warned about being unreadable.
+
+    Called when the agent is rebuilt, i.e. on every config reload. The set is
+    module-level and so outlives the agent; without this, a device that was
+    swapped for a readable one, moved into a zone, or simply re-added after
+    the user acted on the first warning would never warn again for the life of
+    the plugin process — and silence is exactly what this warning exists to
+    prevent.
+    """
+    _unconfirmable_device_ids.clear()
+
+
 def _check_confirm(device, target_level, target_bool) -> bool:
     """Return True if the device's state matches the target values."""
     logger.log(

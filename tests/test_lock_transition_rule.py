@@ -434,6 +434,54 @@ def test_off_light_relay_switched_on_locks(tmp_path):
     )
 
 
+def _state_only_device(dev_id, on, snapshot=False):
+    """A device whose on/off value lives ONLY in states["onOffState"].
+
+    Plenty of third-party plugins report on/off that way and expose no
+    `onState` attribute on the Device object at all. Brightness is left
+    readable so the lock rule itself can still judge the transition — the
+    point under test is the log line, not the rule.
+    """
+    factory = make_snapshot if snapshot else make_device
+    dev = factory(dev_id, device_cls="device", brightness=100 if on else 0, onState=on)
+    del dev.onState
+    del dev.states["onState"]
+    return dev
+
+
+def test_lock_log_line_reads_on_off_from_the_states_mapping(tmp_path, caplog):
+    """The log line must name the change, not print "(was: None; now: None)".
+
+    The lock entry is how a user finds out WHICH device change locked their
+    zone. Reading `onState` as an attribute only makes that entry useless for
+    exactly the devices whose manual switching it exists to explain — the ones
+    that carry on/off in their states mapping alone.
+    """
+    agent, zone = _build(tmp_path, "scenario1_presence_dark_adjust_false.yaml")
+    dev = zone.on_lights_dev_ids[0]
+    _state_only_device(dev, on=True)
+    zone._target_brightness = [{"dev_id": dev, "brightness": True}]
+
+    previous = _state_only_device(dev, on=True, snapshot=True)
+    current = _state_only_device(dev, on=False, snapshot=True)
+
+    with caplog.at_level(logging.INFO, logger="Plugin"):
+        agent.process_device_change(current, {"onOffState": False}, previous)
+
+    assert zone.locked, "precondition: switching the device off must lock the zone"
+
+    lock_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "New lock created" in record.getMessage()
+    ]
+    assert lock_lines, "the lock must be reported at INFO"
+    assert "(was: True; now: False)" in lock_lines[0], (
+        "the lock line did not report the on/off change; it must fall back to "
+        f"states['onOffState'] when the attribute is absent: {lock_lines[0]}"
+    )
+
+
 def test_has_lock_occurred_never_unlocks_a_locked_zone(scenario1):
     """The method locks; it must never unlock.
 

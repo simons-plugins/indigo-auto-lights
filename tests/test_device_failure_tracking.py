@@ -398,6 +398,58 @@ def test_unreadable_device_is_not_at_target_and_warns_once(caplog):
     )
 
 
+def test_unreadable_device_warns_again_after_a_config_reload(caplog):
+    """Once per device, not once per plugin process.
+
+    The set of already-warned devices is module-level, so it outlives the
+    agent. A user who acts on the warning — swaps the device, moves it between
+    zones, re-adds it — rebuilds the agent, and must get a fresh warning if the
+    device is still unreadable. Without the reset the second configuration is
+    silent about a device that can never confirm and can never lock its zone,
+    which is the one thing this warning exists to prevent.
+    """
+    import logging
+
+    utils.reset_confirm_warnings()
+
+    dev = make_device(702, device_cls="device", name="Mystery-702")
+    del dev.brightness
+    del dev.states["brightness"]
+
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        assert utils.is_device_at_target(dev, 100) is False
+        utils.reset_confirm_warnings()
+        assert utils.is_device_at_target(dev, 100) is False
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "Mystery-702" in record.getMessage()
+    ]
+    assert len(warnings) == 2, (
+        f"expected the device to warn again after the warned-set was reset, "
+        f"got {len(warnings)} warning(s): {warnings}"
+    )
+
+
+def test_building_an_agent_resets_the_unreadable_device_warnings(agent_and_zone):
+    """The reload hook itself: constructing an agent clears the warned set.
+
+    Pins the wiring, not just the helper — a reset function nothing calls is
+    the same silence it was written to fix.
+    """
+    agent, zone = agent_and_zone
+    utils._unconfirmable_device_ids.add(703)
+
+    AutoLightsAgent(agent.config)
+
+    assert 703 not in utils._unconfirmable_device_ids, (
+        "rebuilding the agent must clear the already-warned set; a config "
+        "reload is exactly when a user expects to hear about a broken device "
+        "again"
+    )
+
+
 def test_has_brightness_changes_normalizes_relay_bool_targets(agent_and_zone):
     """Relay targets stored as bool should compare through
     is_device_at_target(), not raw integer/bool inequality.

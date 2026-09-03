@@ -38,6 +38,20 @@ def _presence_reading(dev) -> tuple:
     )
 
 
+def _on_off_reading(dev):
+    """The device's on/off value for the lock log line.
+
+    A device from another plugin can carry its on/off value only in its states
+    mapping, under "onOffState", with no `onState` attribute on the object at
+    all. Reading the attribute alone logs "(was: None; now: None)" for exactly
+    the devices whose manual switching the line exists to report.
+    """
+    value = getattr(dev, "onState", None)
+    if value is None:
+        value = (getattr(dev, "states", None) or {}).get("onOffState")
+    return value
+
+
 def _luminance_reading(dev):
     """The part of a luminance device that Zone._read_luminance_values() reads."""
     return getattr(dev, "sensorValue", None)
@@ -47,6 +61,9 @@ class AutoLightsAgent(AutoLightsBase):
     def __init__(self, config: AutoLightsConfig) -> None:
         super().__init__()
         self.config = config
+        # A rebuilt agent means the configuration changed. Devices reported as
+        # unreadable under the old one get one fresh warning under the new.
+        utils.reset_confirm_warnings()
         self._timers = {}
         # Timers for presence-based unlock grace periods
         self._no_presence_timers = {}
@@ -261,8 +278,8 @@ class AutoLightsAgent(AutoLightsBase):
                         new = getattr(current_dev, "brightness", None)
                         change_info = f" (was: {old}; now: {new})"
                     elif "onState" in diff or "onOffState" in diff:
-                        old = getattr(previous_dev, "onState", None)
-                        new = getattr(current_dev, "onState", None)
+                        old = _on_off_reading(previous_dev)
+                        new = _on_off_reading(current_dev)
                         change_info = f" (was: {old}; now: {new})"
                     self.logger.info(
                         f"🔒 New lock created for zone '{zone.name}'; device change from '{current_dev.name}'{change_info}."
