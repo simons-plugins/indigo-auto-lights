@@ -354,6 +354,50 @@ def test_check_confirm_unknown_device_no_brightness():
     assert utils._check_confirm(dev, 100, None) is False
 
 
+def test_unreadable_device_is_not_at_target_and_warns_once(caplog):
+    """A device Auto Lights cannot read must say so — once — and not at target.
+
+    "Not at target" is the safe direction for the send path (command it) and
+    for suppression recovery (stay suppressed), so is_device_at_target()
+    returning False is correct. What is NOT acceptable is doing it silently:
+    such a device is commanded blindly forever, never confirms, and can never
+    create a manual-override lock. The warning is the only signal a user gets.
+
+    Once per device, not once per call — this fall-through runs on every
+    evaluation of every zone the device belongs to, and a per-call warning
+    would bury the log it is meant to make legible.
+    """
+    import logging
+
+    utils._unconfirmable_device_ids.clear()
+
+    dev = make_device(701, device_cls="device", name="Mystery-701")
+    # Strip every route _check_confirm has into the device's brightness.
+    del dev.brightness
+    del dev.states["brightness"]
+    assert not isinstance(dev, indigo.DimmerDevice)
+    assert not isinstance(dev, indigo.RelayDevice)
+    assert not hasattr(dev, "brightness")
+
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        assert utils.is_device_at_target(dev, 100) is False
+        assert utils.is_device_at_target(dev, 100) is False
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "Mystery-701" in record.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning for an unreadable device across two "
+        f"calls, got {len(warnings)}: {warnings}"
+    )
+    assert "never confirm" in warnings[0] and "lock" in warnings[0], (
+        "the warning must name the consequences, not just report that a read "
+        f"failed: {warnings[0]}"
+    )
+
+
 def test_has_brightness_changes_normalizes_relay_bool_targets(agent_and_zone):
     """Relay targets stored as bool should compare through
     is_device_at_target(), not raw integer/bool inequality.

@@ -141,6 +141,39 @@ def test_presence_change_carried_only_in_states_onoffstate(scenario1, monkeypatc
     assert len(calls) == 1
 
 
+def test_gate_reads_the_snapshots_not_the_diff_keys(scenario1, monkeypatch):
+    """Kills the mutation "gate on diff keys" — both directions.
+
+    `diff` is what the device reported, not what the zone reads. A device can
+    move presence while the diff names no key the gate would recognise, and it
+    can name `onState` in the diff without the reading having moved at all
+    (Indigo re-reports a state it already held). Gating on the keys is wrong
+    both ways round: it misses real transitions and lets no-op ticks through.
+    """
+    agent, zone, pres_id, _ = scenario1
+    assert zone._has_device(pres_id) == "presence_dev_ids"
+
+    # A real transition whose diff names no top-level key the gate could use.
+    calls = _count_process_zone(monkeypatch, agent)
+    agent.process_device_change(
+        make_snapshot(pres_id, onState=True),
+        {"states": {"onOffState": True}},
+        make_snapshot(pres_id, onState=False),
+    )
+    assert len(calls) == 1, (
+        "a genuine presence transition was skipped because the diff did not "
+        "name a key the gate recognises; the gate must read the snapshots"
+    )
+
+    # And the reverse: the diff names onState, but nothing actually moved.
+    _forbid_process_zone(monkeypatch, agent)
+    agent.process_device_change(
+        make_snapshot(pres_id, onState=True),
+        {"onState": True},
+        make_snapshot(pres_id, onState=True),
+    )
+
+
 # ---------------------------------------------------------------- luminance
 
 
@@ -178,11 +211,12 @@ def test_luminance_change_reevaluates(scenario1, monkeypatch):
 def test_no_previous_snapshot_keeps_the_old_behaviour(scenario1, monkeypatch):
     """Documented degradation choice: no before-state means no gate.
 
-    A caller that cannot supply `previous_dev` (the suppression retry path,
-    older call sites, a manual re-check) has no transition to compare against.
-    Suppressing re-evaluation there would be a lights-never-respond failure,
-    which is far worse than an occasional redundant re-plan, so the gate
-    deliberately does not apply.
+    No production caller omits `previous_dev` — plugin.py always passes
+    Indigo's origDev — so this is a defensive default rather than a live path,
+    and the older tests in this suite exercise it by calling with two
+    arguments. Suppressing re-evaluation with nothing to compare against
+    would be a lights-never-respond failure, which is far worse than an
+    occasional redundant re-plan, so the gate deliberately does not apply.
     """
     agent, zone, pres_id, _ = scenario1
     current = make_snapshot(pres_id, onState=True)

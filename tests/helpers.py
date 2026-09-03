@@ -109,28 +109,50 @@ def settle_zone(agent, zone, timeout=5.0):
     Patches utils.send_to_indigo so the commanded value lands on the stub
     device (the stub indigo has no `indigo.dimmer`, so a real send would raise
     inside the writer thread and record failures), runs process_zone, then
-    waits for the writer threads to check the zone back in. Leaves the zone
-    at target and unlocked — the baseline every lock test needs before it can
-    fire a meaningful event.
+    waits for the writer threads to finish. Leaves the zone at target and
+    unlocked — the baseline every lock test needs before it can fire a
+    meaningful event.
+
+    Waiting for check-in is not enough on its own: each writer calls check_in()
+    and *then* re-runs process_zone, so a test that returns on check-in can have
+    its own setup (a re-planned target, a fired event) overtaken by that
+    follow-up run. Waiting for the threads themselves to exit makes the zone
+    genuinely quiescent when this returns.
     """
+    import threading
     import time
     from unittest.mock import patch
+
+    import indigo
+    from auto_lights.utils import is_device_at_target
 
     def _send(dev_id, desired, **kwargs):
         _apply_commanded_value(dev_id, desired)
         return True
 
+    pre_existing = set(threading.enumerate())
+
     with patch("auto_lights.utils.send_to_indigo", side_effect=_send):
         agent.process_zone(zone)
-        # The writer thread re-runs process_zone after check-in, so wait for
-        # check-in rather than for a single pass, then confirm the device
-        # actually landed on target.
         deadline = time.monotonic() + timeout
-        while zone.checked_out and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            writers = [
+                t
+                for t in threading.enumerate()
+                if t not in pre_existing and t.is_alive()
+            ]
+            if not zone.checked_out and not writers:
+                break
             time.sleep(0.02)
 
     assert not zone.checked_out, f"zone '{zone.name}' never checked back in"
     assert not zone.locked, f"zone '{zone.name}' locked while settling"
+    for tgt in zone.target_brightness or []:
+        dev_id = tgt["dev_id"]
+        assert is_device_at_target(indigo.devices[dev_id], target_for(zone, dev_id)), (
+            f"device {dev_id} did not land on its target while settling zone "
+            f"'{zone.name}'; every lock test's baseline depends on this"
+        )
     return zone
 
 

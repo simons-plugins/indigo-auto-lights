@@ -22,11 +22,13 @@ LOCK_EXPIRY_GRACE_SECONDS = 2
 def _presence_reading(dev) -> tuple:
     """The part of a presence device that Zone.has_presence_detected() reads.
 
-    Mirrors that method exactly: it consults states["onState"] and
-    states["onOffState"], and the onState attribute is included because the
-    stub/real Device objects expose it alongside the states mapping. A device
-    with no states mapping at all is treated as an empty one rather than
-    raising — an unreadable snapshot must not take the callback thread down.
+    That method consults the two state keys "onState" and "onOffState"; this
+    tuple carries both, plus the onState attribute the Device object exposes
+    alongside them. The extra element makes the reading strictly finer-grained
+    than the zone's, so it can only cause a redundant re-evaluation, never a
+    missed one. A device with no states mapping at all is treated as an empty
+    one rather than raising — an unreadable snapshot must not take the
+    callback thread down.
     """
     states = getattr(dev, "states", None) or {}
     return (
@@ -206,7 +208,9 @@ class AutoLightsAgent(AutoLightsBase):
               - Re-evaluate the zone only if the device's presence (on/off) or
                 luminance (sensorValue) reading actually changed; any other
                 update to that device (display text, timers, comm timestamps)
-                is ignored.
+                is ignored. The one exception is an event with no previous
+                snapshot (previous_dev is None): there is nothing to compare,
+                so the gate does not apply and the zone is re-evaluated.
 
         Returns:
             List[Zone]: List of Zone's processed
@@ -216,6 +220,11 @@ class AutoLightsAgent(AutoLightsBase):
         # SuppressionManager clears suppression and re-evaluates the zone.
         self.suppression_manager.note_device_event(current_dev.id)
         for zone in self.config.zones:
+            # _has_device reports "exclude_from_lock_dev_ids" ahead of the
+            # light lists, so an excluded device never reaches the lock branch
+            # below. The matching check inside Zone._is_external_change is a
+            # second line of defence, for callers that reach has_lock_occurred
+            # directly rather than through here.
             device_prop = zone._has_device(current_dev.id)
             if device_prop in ["on_lights_dev_ids", "off_lights_dev_ids"]:
                 if not zone.enabled:
@@ -280,21 +289,15 @@ class AutoLightsAgent(AutoLightsBase):
                     self._schedule_lock_check(zone)
             elif device_prop in ["presence_dev_ids", "luminance_dev_ids"]:
                 # Re-evaluate only when the reading this zone actually consumes
-                # has changed. An Occupatum occupancy device used as a presence
-                # sensor updates a delay_timer state and its display string
-                # every ~1.2s while its off-delay counts down, and again on
-                # every re-trip; re-planning the zone on each of those re-applied
-                # period levels about once a second, reverting the user's manual
-                # dimmer change within a second, and the load on the callback
-                # thread delayed the light's own change notification by ~10s —
-                # all while neither presence on/off nor the light sensor value
-                # had moved. The comparison reads the two snapshots directly
-                # rather than the keys of `diff`, so it mirrors what the zone
-                # reads instead of what the device happened to report.
-                #
-                # With no previous snapshot there is nothing to compare, so the
-                # gate does not apply: silently skipping re-evaluation there
-                # would be a lights-never-respond failure.
+                # has changed, compared between the two snapshots rather than
+                # from the keys of `diff` — a presence device can re-report
+                # every second with its reading unchanged, and re-planning on
+                # each tick reverted manual changes and starved the callback
+                # thread. With no previous snapshot there is nothing to
+                # compare, so the gate does not apply: silently skipping
+                # re-evaluation there would be a lights-never-respond failure.
+                # The sighting details live in
+                # tests/test_reeval_only_on_sensor_change.py and issue #15.
                 if previous_dev is not None:
                     if device_prop == "presence_dev_ids":
                         unchanged = _presence_reading(

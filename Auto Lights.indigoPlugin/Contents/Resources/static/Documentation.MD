@@ -54,7 +54,7 @@ A Zone typically includes:
 - **Unlock When No Presence**: Enable to unlock the zone when no presence is detected. A grace period of 30 seconds is applied before unlocking to avoid rapid toggles. Recommend leaving this off for zones where you may want an override to outlast the presence of the room, like a hallway.
 - **Exclude from Lock**: If certain devices shouldn’t trigger a manual override lock, add them here. Use it for a
   device that is only ever driven by automation (a hallway lamp with no wall control), or for one whose reported
-  state wanders on its own by more than the confirmation band. Slow or fading dimmers no longer need it: a lock is
+  state wanders on its own by more than the confirmation band. Slow or fading dimmers do not need it: a lock is
   only created when a device that was resting at its target is moved away from it, so the plugin’s own ramps and
   late confirmations cannot lock a zone.
 
@@ -98,8 +98,8 @@ If a light stops responding reliably, Auto Lights now tries to fail safely inste
 - **Device failure suppression**  
   If a light fails to confirm **3 commands in a row**, Auto Lights temporarily stops sending commands to that specific device. Other lights in the zone can continue working normally.
 
-- **Brightness is confirmed within 1 percentage point**  
-  Some device plugins carry brightness in a native range (zigbee 0–254, Z-Wave 0–99) and report a percentage back one point below the one that was commanded — ask for 30%, the device honestly says 29%. Auto Lights accepts that, so healthy dimmers are not suppressed for a rounding difference. Fully off and fully on must still match exactly, so a light that failed to switch is still treated as a failure.
+- **Brightness is confirmed within a small band around the target**  
+  Some device plugins carry brightness in a native range (zigbee 0–254, Z-Wave 0–99) and report a percentage back a little below the one that was commanded — ask for 30%, the device honestly says 28%. The gap grows with the level, so the band does too: Auto Lights accepts anything within 10% of the target, and never less than 1 percentage point. Healthy dimmers are therefore not suppressed for a rounding difference. Fully off (0) and fully on (100) must still match exactly, so a light that failed to switch is still treated as a failure.
 
 - **How the device starts working again**  
   Suppression clears automatically once the device's actual state matches what Auto Lights expects. In practice, that usually means the device starts reporting correct on/off or brightness state again after the hardware problem is fixed.

@@ -3,19 +3,26 @@
 `has_lock_occurred(previous_dev, current_dev)` locks a zone only when THIS
 event moved THIS device from at-target to off-target. Everything below is a
 mutation test: each docstring names the promise and the specific wrong
-implementation the test kills, because the two previous implementations of
-this rule each looked fine against the happy-path suite.
+implementation the test kills, because attempt 1 at this rule (issue #15)
+looked fine against the happy-path suite.
 
   - The whole-zone LIVE read ("is anything off target right now?") lost a
     genuine override to a concurrent revert and self-locked whenever any
     OTHER device in the zone was still ramping.
   - Judging the NEW value alone ("is the device off target now?") locked the
     zone on every intermediate step of the plugin's own dimmer ramp.
+
+M1 — the concurrent-revert promise this rule exists for — lives in
+tests/test_lock_survives_concurrent_revert.py. M12, the recent-command echo
+window, lives in tests/test_lock_echo_after_target_revert.py.
 """
 
 import json
 import logging
+import threading
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -23,6 +30,7 @@ import indigo
 from auto_lights.auto_lights_config import AutoLightsConfig
 from auto_lights.auto_lights_agent import AutoLightsAgent
 from tests.helpers import (
+    _apply_commanded_value,
     load_yaml,
     make_device,
     make_snapshot,
@@ -312,13 +320,28 @@ def test_no_previous_state_means_no_lock(scenario1, caplog):
 
 
 def test_excluded_device_does_not_lock(scenario1):
-    """M10a — exclude_from_lock_dev_ids still short-circuits the rule."""
+    """M10a — exclude_from_lock_dev_ids still short-circuits the rule.
+
+    Two paths, because there are two checks. Through the agent,
+    `_has_device` reports "exclude_from_lock_dev_ids" ahead of the light
+    lists and the event never reaches the lock branch. The direct call pins
+    the check inside `_is_external_change`, which is what protects any caller
+    that reaches `has_lock_occurred` without going through the agent.
+    """
     agent, zone, dev = scenario1
     settle_zone(agent, zone)
     zone.exclude_from_lock_dev_ids = [dev]
 
     _fire(agent, dev, 100, 30)
 
+    assert not zone.locked
+
+    previous = make_snapshot(dev, brightness=100)
+    current = make_snapshot(dev, brightness=30)
+    assert not zone.has_lock_occurred(previous, current), (
+        "the exclusion check inside _is_external_change was removed; a direct "
+        "caller could then lock the zone on an excluded device"
+    )
     assert not zone.locked
 
 
@@ -330,8 +353,9 @@ def test_suppressed_device_does_not_lock(scenario1):
     """
     agent, zone, dev = scenario1
     settle_zone(agent, zone)
-    # A suppressed device is, by definition, not sitting at its target — keep
-    # the live state off target so note_device_event does not un-suppress it.
+    # SuppressionManager.note_device_event un-suppresses a device that is
+    # sitting at its target, and process_device_change calls it first thing.
+    # Keep the live state off target so the suppression survives the event.
     indigo.devices[dev].brightness = 30
     indigo.devices[dev].states["brightness"] = 30
     suppress_device(agent, zone, dev)
@@ -342,8 +366,29 @@ def test_suppressed_device_does_not_lock(scenario1):
     assert not zone.locked
 
 
-def test_device_without_a_target_does_not_lock(scenario1):
-    """M10c — no target entry for the device means nothing to compare against."""
+def test_device_missing_from_a_real_plan_does_not_lock(multi_device):
+    """M10c — a device the current plan omits has nothing to compare against.
+
+    The realistic shape of "no target": the zone planned for 102 only — 101
+    was excluded from this lighting period, say — so 101's report cannot be
+    judged as at-target or off-target and must not lock the zone.
+    """
+    agent, zone = multi_device
+    settle_zone(agent, zone)
+    dev_a, dev_b = zone.on_lights_dev_ids[0], zone.on_lights_dev_ids[1]
+
+    zone._target_brightness = [{"dev_id": dev_b, "brightness": 100}]
+
+    _fire(agent, dev_a, 100, 30)
+
+    assert not zone.locked, (
+        "a device absent from the current plan locked the zone; there is no "
+        "target for it, so no transition can be judged"
+    )
+
+
+def test_empty_plan_does_not_lock(scenario1):
+    """M10c sibling — a zone that evaluated to no targets at all cannot lock."""
     agent, zone, dev = scenario1
     settle_zone(agent, zone)
     # The setter rebuilds from a list, so clear the backing store directly.
@@ -363,6 +408,79 @@ def test_disabled_zone_does_not_lock(scenario1):
     _fire(agent, dev, 100, 30)
 
     assert not zone.locked
+
+
+def test_off_light_relay_switched_on_locks(tmp_path):
+    """Polarity — a relay whose target is OFF locks when the user switches it ON.
+
+    Every other relay case in this file has a target of True, so a rule that
+    quietly treated "on" as at-target and "off" as off-target would pass them
+    all. Here the target is False: at-target is off, and the transition that
+    counts runs the other way. The zone is deliberately never settled, so no
+    command is recorded and the change cannot be excused as our own echo.
+    """
+    agent, zone = _build(tmp_path, "scenario1_presence_dark_adjust_false.yaml")
+    dev = zone.on_lights_dev_ids[0]
+    make_device(dev, device_cls="relay", onState=False)
+    zone._target_brightness = [{"dev_id": dev, "brightness": False}]
+
+    previous = make_snapshot(dev, device_cls="relay", onState=False)
+    current = make_snapshot(dev, device_cls="relay", onState=True)
+    agent.process_device_change(current, {"onState": True}, previous)
+
+    assert zone.locked, (
+        "switching ON a relay whose target is OFF failed to lock; the rule "
+        "must judge against the target, not against 'on means at target'"
+    )
+
+
+def test_has_lock_occurred_never_unlocks_a_locked_zone(scenario1):
+    """The method locks; it must never unlock.
+
+    Kills "if self.locked != result: self.locked = result". Under that form
+    any non-override event — the device settling back onto target, a routine
+    echo — called on a locked zone would clear the lock. The agent's
+    `not zone.locked` guard hid it, so nothing but a direct call shows it.
+    """
+    agent, zone, dev = scenario1
+    settle_zone(agent, zone)
+    zone.locked = True
+
+    previous = make_snapshot(dev, brightness=100)
+    current = make_snapshot(dev, brightness=100)
+
+    assert not zone.has_lock_occurred(previous, current)
+    assert zone.locked, (
+        "a non-override event cleared an existing lock; has_lock_occurred "
+        "must only ever set the lock, never release it"
+    )
+
+
+def test_missing_previous_state_warns_on_the_lock_path(scenario1, caplog):
+    """A caller that drops previous_dev has silently disabled lock detection.
+
+    Production always supplies Indigo's origDev, so reaching this branch means
+    a call site is wrong. Debug is where that goes unnoticed for months; a
+    WARNING names the device and the zone that stopped detecting overrides.
+    """
+    agent, zone, dev = scenario1
+    settle_zone(agent, zone)
+
+    current = make_snapshot(dev, brightness=30)
+    with caplog.at_level(logging.WARNING, logger="Plugin"):
+        assert not zone.has_lock_occurred(None, current)
+
+    assert not zone.locked
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert any("no previous state" in message for message in warnings), (
+        "a missing previous state must be reported at WARNING; at DEBUG a "
+        "caller that disabled locking would never be noticed"
+    )
+    assert any(zone.name in message for message in warnings)
 
 
 # ---------------------------------------------------------------- M11
@@ -440,3 +558,60 @@ def test_unreadable_device_warns_and_does_not_lock(scenario1, caplog):
         for record in caplog.records
         if record.levelno >= logging.WARNING
     ), "an unreadable device must be reported, not silently ignored"
+
+
+# ---------------------------------------------------------------- mid-write
+
+
+def test_lock_created_mid_write_is_honoured_by_the_writer_reeval(scenario1):
+    """A lock taken while a write is in flight must survive the follow-up run.
+
+    M6 shows the lock gets created during the write burst. This is the other
+    half: every writer thread re-runs `process_zone` after checking the zone
+    back in, and that run happens *after* the lock exists. If it did not
+    respect the lock it would re-command the device and undo the very change
+    the lock was created to protect — the user would see the light snap back
+    a second later, with a lock held over the reverted value.
+
+    The write is held open inside the patched send so the manual change lands
+    while the zone is genuinely checked out.
+    """
+    agent, zone, dev = scenario1
+    release = threading.Event()
+    sends: list[tuple[int, object]] = []
+
+    def _send(dev_id, desired, **kwargs):
+        _apply_commanded_value(dev_id, desired)
+        sends.append((dev_id, desired))
+        assert release.wait(5), "the writer was never released"
+        return True
+
+    with patch("auto_lights.utils.send_to_indigo", side_effect=_send):
+        assert agent.process_zone(zone) is True
+
+        deadline = time.monotonic() + 2.0
+        while not sends and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sends == [
+            (dev, 100)
+        ], "precondition: the plugin's own write must be in flight"
+        assert zone.checked_out, "precondition: the zone must be checked out"
+        assert not zone.locked
+
+        # The user reaches for the dial while the write is still open.
+        _apply_commanded_value(dev, 30)
+        _fire(agent, dev, 100, 30)
+        assert zone.locked, "a manual change during the write burst must lock"
+
+        release.set()
+        deadline = time.monotonic() + 5.0
+        while zone.checked_out and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+    assert not zone.checked_out, "the writer never checked the zone back in"
+    assert zone.locked, "the lock was lost across the writer's follow-up re-eval"
+    assert sends == [(dev, 100)], (
+        "the writer's follow-up process_zone re-commanded the device despite "
+        "the lock, reverting the manual change it was meant to protect"
+    )
+    assert indigo.devices[dev].brightness == 30
