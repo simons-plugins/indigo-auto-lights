@@ -19,10 +19,51 @@ except ImportError:
 LOCK_EXPIRY_GRACE_SECONDS = 2
 
 
+def _presence_reading(dev) -> tuple:
+    """The part of a presence device that Zone.has_presence_detected() reads.
+
+    That method consults the two state keys "onState" and "onOffState"; this
+    tuple carries both, plus the onState attribute the Device object exposes
+    alongside them. The extra element makes the reading strictly finer-grained
+    than the zone's, so it can only cause a redundant re-evaluation, never a
+    missed one. A device with no states mapping at all is treated as an empty
+    one rather than raising — an unreadable snapshot must not take the
+    callback thread down.
+    """
+    states = getattr(dev, "states", None) or {}
+    return (
+        getattr(dev, "onState", None),
+        states.get("onState"),
+        states.get("onOffState"),
+    )
+
+
+def _on_off_reading(dev):
+    """The device's on/off value for the lock log line.
+
+    A device from another plugin can carry its on/off value only in its states
+    mapping, under "onOffState", with no `onState` attribute on the object at
+    all. Reading the attribute alone logs "(was: None; now: None)" for exactly
+    the devices whose manual switching the line exists to report.
+    """
+    value = getattr(dev, "onState", None)
+    if value is None:
+        value = (getattr(dev, "states", None) or {}).get("onOffState")
+    return value
+
+
+def _luminance_reading(dev):
+    """The part of a luminance device that Zone._read_luminance_values() reads."""
+    return getattr(dev, "sensorValue", None)
+
+
 class AutoLightsAgent(AutoLightsBase):
     def __init__(self, config: AutoLightsConfig) -> None:
         super().__init__()
         self.config = config
+        # A rebuilt agent means the configuration changed. Devices reported as
+        # unreadable under the old one get one fresh warning under the new.
+        utils.reset_confirm_warnings()
         self._timers = {}
         # Timers for presence-based unlock grace periods
         self._no_presence_timers = {}
@@ -170,12 +211,23 @@ class AutoLightsAgent(AutoLightsBase):
         Process a device change event.
 
         For each zone in the agent:
-          - Call zone.has_device(orig_dev.id)
+          - Call zone._has_device(current_dev.id)
           - If the returned property is 'on_lights_dev_ids' or 'off_lights_dev_ids':
-              - If the zone's current_lights_status does not equal its target_brightness,
-                set zone.locked to True.
+              - Ask zone.has_lock_occurred(previous_dev, current_dev), which
+                locks the zone only when THIS device went from at-target to
+                off-target across this one event. It never re-reads live state
+                and never looks at the zone's other devices, so the plugin's
+                own writes (always issued to an off-target device) cannot
+                self-lock, and a concurrent revert cannot erase the evidence.
+              - An event with no previous state (previous_dev is None) is not
+                judged at all: no lock.
           - If the property is 'presence_dev_ids' or 'luminance_dev_ids':
-              - Process the change by calling self.process_zone(zone)
+              - Re-evaluate the zone only if the device's presence (on/off) or
+                luminance (sensorValue) reading actually changed; any other
+                update to that device (display text, timers, comm timestamps)
+                is ignored. The one exception is an event with no previous
+                snapshot (previous_dev is None): there is nothing to compare,
+                so the gate does not apply and the zone is re-evaluated.
 
         Returns:
             List[Zone]: List of Zone's processed
@@ -185,6 +237,11 @@ class AutoLightsAgent(AutoLightsBase):
         # SuppressionManager clears suppression and re-evaluates the zone.
         self.suppression_manager.note_device_event(current_dev.id)
         for zone in self.config.zones:
+            # _has_device reports "exclude_from_lock_dev_ids" ahead of the
+            # light lists, so an excluded device never reaches the lock branch
+            # below. The matching check inside Zone._is_external_change is a
+            # second line of defence, for callers that reach has_lock_occurred
+            # directly rather than through here.
             device_prop = zone._has_device(current_dev.id)
             if device_prop in ["on_lights_dev_ids", "off_lights_dev_ids"]:
                 if not zone.enabled:
@@ -208,20 +265,21 @@ class AutoLightsAgent(AutoLightsBase):
                     )
                     continue
 
-                if zone.lock_enabled and not zone.locked and zone.has_lock_occurred():
-                    prior_dev = previous_dev or current_dev
+                if (
+                    zone.lock_enabled
+                    and not zone.locked
+                    and zone.has_lock_occurred(previous_dev, current_dev)
+                ):
+                    # has_lock_occurred() only returns True after comparing a
+                    # real previous_dev, so it is never None here.
                     change_info = ""
                     if "brightness" in diff:
-                        old = getattr(prior_dev, "brightness", None)
-                        new = diff["brightness"]
+                        old = getattr(previous_dev, "brightness", None)
+                        new = getattr(current_dev, "brightness", None)
                         change_info = f" (was: {old}; now: {new})"
-                    elif "onState" in diff:
-                        old = prior_dev.states.get("onState", False)
-                        new = diff["onState"]
-                        change_info = f" (was: {old}; now: {new})"
-                    elif "onOffState" in diff:
-                        old = prior_dev.states.get("onOffState", False)
-                        new = diff["onOffState"]
+                    elif "onState" in diff or "onOffState" in diff:
+                        old = _on_off_reading(previous_dev)
+                        new = _on_off_reading(current_dev)
                         change_info = f" (was: {old}; now: {new})"
                     self.logger.info(
                         f"🔒 New lock created for zone '{zone.name}'; device change from '{current_dev.name}'{change_info}."
@@ -247,6 +305,35 @@ class AutoLightsAgent(AutoLightsBase):
                     # Arm the single lock-expiry timer for this zone.
                     self._schedule_lock_check(zone)
             elif device_prop in ["presence_dev_ids", "luminance_dev_ids"]:
+                # Re-evaluate only when the reading this zone actually consumes
+                # has changed, compared between the two snapshots rather than
+                # from the keys of `diff` — a presence device can re-report
+                # every second with its reading unchanged, and re-planning on
+                # each tick reverted manual changes and starved the callback
+                # thread. With no previous snapshot there is nothing to
+                # compare, so the gate does not apply: silently skipping
+                # re-evaluation there would be a lights-never-respond failure.
+                # The sighting details live in
+                # tests/test_reeval_only_on_sensor_change.py and issue #15.
+                if previous_dev is not None:
+                    if device_prop == "presence_dev_ids":
+                        unchanged = _presence_reading(
+                            previous_dev
+                        ) == _presence_reading(current_dev)
+                        reading = "presence"
+                    else:
+                        unchanged = _luminance_reading(
+                            previous_dev
+                        ) == _luminance_reading(current_dev)
+                        reading = "luminance"
+                    if unchanged:
+                        self._debug_log(
+                            f"Update from '{current_dev.name}' carried no change to "
+                            f"its {reading} reading; not re-evaluating zone "
+                            f"'{zone.name}'"
+                        )
+                        continue
+
                 # Invalidate the corresponding runtime cache so the next
                 # process_zone reads fresh sensor state. Without this, a
                 # luminance update could re-evaluate against a stale is_dark

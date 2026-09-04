@@ -60,6 +60,16 @@ MAX_CONSECUTIVE_FAILURES = 3
 MAX_REEVAL_BURST = 5
 REEVAL_WINDOW_SECONDS = 30.0
 
+# How long a device's pre-command state stays on record as an excuse for a
+# transition that starts from it. The window only has to cover the queued-echo
+# race — the echo of our command being delivered after a re-plan has already
+# put the target back onto the value the device was at when we commanded it —
+# which is bounded by send_to_indigo()'s 2s confirmation settle plus callback
+# latency. A long window would excuse real people: every second of it is a
+# second in which a genuine manual move away from that same state is read as
+# ours and missed.
+COMMAND_ECHO_WINDOW_SECONDS = 15
+
 # How long is_dark() may keep reporting the last real darkness decision while
 # the zone's luminance sensors are unreadable. Holding is a bridge across a
 # dropped report; past this the reading is not credible (a flat battery would
@@ -244,6 +254,15 @@ class Zone(AutoLightsBase):
         # counter for in-flight write commands
         self._pending_writes = 0
         self._write_lock = threading.Lock()
+
+        # Per device, the states we recently commanded the device AWAY from,
+        # newest last. Lets the lock rule recognise an echo of our own write
+        # even when the target has since moved back onto the device's
+        # pre-command value. Guarded by its own lock rather than _write_lock:
+        # the Indigo callback thread reads this on every device event and must
+        # not queue behind the writer threads' pending-write bookkeeping.
+        self._recent_commands: dict[int, Deque[Tuple[Union[int, bool], float]]] = {}
+        self._recent_commands_lock = threading.Lock()
 
         # Sliding window of writer-thread re-eval timestamps (monotonic).
         # Guarded by _reeval_lock; only touched from save_brightness_changes
@@ -1314,6 +1333,14 @@ class Zone(AutoLightsBase):
                 )
                 should_process = False
                 try:
+                    # Remember the state the device is in before the command is
+                    # sent, so an echo that arrives after a re-plan moved the
+                    # target back onto that state can still be recognised as
+                    # ours. The SuppressionManager's retry path deliberately
+                    # does NOT record: a suppressed device is excluded from the
+                    # lock rule anyway, so its retries can never reach this
+                    # check.
+                    self._note_command(dev_id)
                     confirmed = utils.send_to_indigo(
                         dev_id, desired_brightness, clock=clock
                     )
@@ -2054,15 +2081,192 @@ class Zone(AutoLightsBase):
 
         return ";".join(lines)
 
-    def has_lock_occurred(self) -> bool:
-        """Determine if an external change should create a new zone lock."""
-        # if we’re in the middle of our own process_zone run, don’t treat our device writes as
-        # an external change that should create a new lock.
-        if self.checked_out:
+    def has_lock_occurred(self, previous_dev, current_dev) -> bool:
+        """Decide whether ONE device-change event is a manual override.
+
+        The rule is a transition on the device the event is about: the state
+        BEFORE the change (Indigo's ``origDev``) was at target and the state
+        AFTER the change is not. Nothing else is consulted — no live re-read
+        of the device, and no scan of the other devices in the zone — so a
+        concurrent ``process_zone`` that reverts the change before this
+        callback looks cannot erase the evidence, which is the snapshot pair
+        Indigo handed us.
+
+        Why Auto Lights' own writes cannot satisfy it: the plugin only ever
+        commands a device that is NOT at target
+        (``save_brightness_changes`` skips at-target devices and
+        ``send_to_indigo`` pre-checks again), so every echo of a command —
+        first report, intermediate ramp step, final value, late straggler —
+        has an off-target previous state. AND, because a re-plan between the
+        command and its echo can put the target back onto the device's
+        pre-command state, a transition whose STARTING point is a state we
+        commanded the device away from within ``COMMAND_ECHO_WINDOW_SECONDS``
+        is excused even when it does read as at-target → off-target. Each
+        recorded command excuses one such transition and is then consumed.
+
+        This method has a side effect: when it returns True it sets
+        ``self.locked``. It never clears a lock.
+
+        Two earlier implementations of this rule are ruled out by the tests:
+        the whole-zone LIVE read (#15, #10) and the dropped ``checked_out``
+        early return (test M6 in ``tests/test_lock_transition_rule.py``).
+        """
+        if previous_dev is None:
+            self.logger.warning(
+                f"Zone '{self._name}': device change from "
+                f"'{getattr(current_dev, 'name', 'unknown')}' "
+                f"({getattr(current_dev, 'id', 'unknown')}) arrived with no "
+                f"previous state; the transition cannot be judged, so manual "
+                f"override detection is disabled for this event"
+            )
             return False
 
-        result = self.has_brightness_changes(exclude_lock_devices=True)
+        result = self._is_external_change(previous_dev, current_dev)
         self._debug_log(f"has_lock_occurred result: {result}")
-        if self.locked != result:
-            self.locked = result
+        if result and not self.locked:
+            self.locked = True
         return result
+
+    def _note_command(self, dev_id: int) -> None:
+        """Record the state `dev_id` is in as we command it away from that state.
+
+        It is the PRE-command state that identifies the echo, not the value we
+        asked for: the echo we have to excuse is the device's own report of
+        leaving that state, and a dimmer reports it one ramp step at a time, on
+        none of which does it read back the value we commanded.
+
+        Only the last few states per device are kept; a burst longer than that
+        is a ramp, whose intermediate steps the transition rule already
+        excuses because the previous state was off-target.
+
+        This is bookkeeping, and bookkeeping must never cost a command: the
+        caller runs inside the writer's try/except, so a read that raised here
+        would abandon the send and be recorded as a device failure. A device we
+        cannot read simply gets no record, and its echoes fall back to the
+        transition rule alone — stricter, not blinder.
+        """
+        try:
+            pre = self._normalize_dev_target_brightness(dev_id)
+        except Exception:
+            self.logger.exception(
+                f"Zone '{self._name}': cannot read device {dev_id} to record "
+                f"the state it is being commanded away from. The command is "
+                f"still sent, but a delayed echo of it may be read as a manual "
+                f"override and lock this zone"
+            )
+            return
+        with self._recent_commands_lock:
+            history = self._recent_commands.get(dev_id)
+            if history is None:
+                history = deque(maxlen=4)
+                self._recent_commands[dev_id] = history
+            history.append((pre, time.monotonic()))
+
+    def _echo_of_recent_command(self, dev_id: int, previous_dev) -> Optional[float]:
+        """Age of the command this transition is the echo of, or None.
+
+        A match means the transition STARTED from a state we commanded the
+        device away from inside the window — which is what our own delayed
+        report looks like once a re-plan has moved the target back onto that
+        same state.
+
+        The matched record is consumed: one command excuses one transition. A
+        record left in place would excuse the same manual change over and over
+        (the zone re-plans the light back on, the user switches it off again,
+        and every attempt is read as our echo). Prunes entries older than
+        COMMAND_ECHO_WINDOW_SECONDS as it goes.
+        """
+        now = time.monotonic()
+        cutoff = now - COMMAND_ECHO_WINDOW_SECONDS
+        with self._recent_commands_lock:
+            history = self._recent_commands.get(dev_id)
+            if not history:
+                return None
+            while history and history[0][1] < cutoff:
+                history.popleft()
+            for index, (pre, ts) in enumerate(history):
+                if utils.device_at_target_or_raise(previous_dev, pre):
+                    del history[index]
+                    return now - ts
+        return None
+
+    def _is_external_change(self, previous_dev, current_dev) -> bool:
+        """Return True if this event moved the device OFF its target.
+
+        Per event, per device: the device must have a target in this zone, not
+        be excluded from locking, and not be suppressed; then the transition
+        must be at-target → not-at-target.
+
+        The exclusion check here is defence in depth. On the agent's path
+        ``_has_device`` already returns "exclude_from_lock_dev_ids" for an
+        excluded device, which routes the event away from the lock branch
+        entirely; this repeats the check for callers that reach
+        ``has_lock_occurred`` directly.
+        """
+        if not self.enabled:
+            self._debug_log("_is_external_change: zone is disabled")
+            return False
+        if self.target_brightness is None:
+            self._debug_log(
+                "_is_external_change: zone has never been evaluated, so there "
+                "is no target to judge the change against"
+            )
+            return False
+        if not self.target_brightness:
+            self._debug_log(
+                "_is_external_change: zone evaluated to an empty plan, so no "
+                "device in it has a target to be moved away from"
+            )
+            return False
+
+        dev_id = current_dev.id
+
+        if dev_id in self.exclude_from_lock_dev_ids:
+            self._debug_log(
+                f"_is_external_change: device {dev_id} is excluded from lock detection"
+            )
+            return False
+
+        if self._is_device_suppressed(dev_id):
+            self._debug_log(f"_is_external_change: device {dev_id} is suppressed")
+            return False
+
+        desired = None
+        for tgt in self.target_brightness:
+            if tgt["dev_id"] == dev_id:
+                desired = tgt["brightness"]
+                break
+        if desired is None:
+            self._debug_log(
+                f"_is_external_change: no target recorded for device {dev_id}"
+            )
+            return False
+
+        try:
+            was_at_target = utils.device_at_target_or_raise(previous_dev, desired)
+            now_at_target = utils.device_at_target_or_raise(current_dev, desired)
+            if was_at_target and not now_at_target:
+                echo_age = self._echo_of_recent_command(dev_id, previous_dev)
+                if echo_age is not None:
+                    self._debug_log(
+                        f"_is_external_change: device {dev_id} moved off a "
+                        f"state we commanded it away from {echo_age:.1f}s ago, "
+                        f"so this is the echo of that command arriving after "
+                        f"the target moved back to {desired}; no lock"
+                    )
+                    return False
+        except Exception as e:
+            # Degradation path: a device whose state we cannot read must say
+            # so, not quietly become a device that can never lock its zone.
+            self.logger.warning(
+                f"Zone '{self._name}': cannot judge the change from "
+                f"'{getattr(current_dev, 'name', dev_id)}' against target "
+                f"{desired} ({e!r}); no lock created"
+            )
+            return False
+
+        self._debug_log(
+            f"_is_external_change: device {dev_id}: desired={desired}, "
+            f"was_at_target={was_at_target}, now_at_target={now_at_target}"
+        )
+        return was_at_target and not now_at_target

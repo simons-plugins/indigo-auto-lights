@@ -66,9 +66,12 @@ def test_lock_expiry_writes_healthy_devices_skips_suppressed(
     in the zone must resume normal automation. The broken device stays
     skipped; the healthy device gets written.
 
-    This is the happy-path interaction: a self-induced lock from a flaky
-    device gives the zone a breather, suppression engages in the meantime,
-    and the rest of the zone keeps working when the lock lifts.
+    This is the happy-path interaction: a zone locked by a genuine manual
+    override sits still for the lock's duration, one of its devices is
+    suppressed in the meantime, and the rest of the zone resumes normally
+    when the lock lifts. (A flaky device cannot itself create a lock under
+    the transition rule — it is off target before and after every report —
+    so the lock here is the user's, not the device's.)
     """
     agent, zone = multi_device_agent
     dev_healthy = 101
@@ -134,8 +137,8 @@ def test_locked_zone_does_not_create_new_lock_for_suppressed_flap(
     its own failure count, and must NOT call process_zone.
 
     This is the worst-case flapping-Z-Wave-repeater scenario: a broken node
-    fires deviceUpdated repeatedly while the zone is in its self-induced
-    lock cooldown. The plugin should sit still through it.
+    fires deviceUpdated repeatedly while the zone is locked by a genuine
+    manual override. The plugin should sit still through it.
     """
     import datetime
 

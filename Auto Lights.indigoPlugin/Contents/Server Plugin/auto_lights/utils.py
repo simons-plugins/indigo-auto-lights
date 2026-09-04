@@ -91,6 +91,25 @@ class PerfClock:
         return int((time.monotonic() - self.start) * 1000)
 
 
+# Device ids already reported as unreadable by _check_confirm's fall-through.
+# The condition is a property of the device, not of one call, so it is worth
+# one WARNING each rather than one per evaluation.
+_unconfirmable_device_ids: set = set()
+
+
+def reset_confirm_warnings() -> None:
+    """Forget which devices have already warned about being unreadable.
+
+    Called when the agent is rebuilt, i.e. on every config reload. The set is
+    module-level and so outlives the agent; without this, a device that was
+    swapped for a readable one, moved into a zone, or simply re-added after
+    the user acted on the first warning would never warn again for the life of
+    the plugin process — and silence is exactly what this warning exists to
+    prevent.
+    """
+    _unconfirmable_device_ids.clear()
+
+
 def _check_confirm(device, target_level, target_bool) -> bool:
     """Return True if the device's state matches the target values."""
     logger.log(
@@ -113,18 +132,43 @@ def _check_confirm(device, target_level, target_bool) -> bool:
         elif "brightness" in getattr(device, "states", {}):
             result = _brightness_matches(device.states["brightness"], target_level)
         else:
-            # Cannot confirm state — assume NOT at target so command is sent
+            # Cannot confirm state — assume NOT at target so command is sent.
+            # Warn once per device: this is not a transient miss but a
+            # permanent property of the device as Auto Lights sees it. Such a
+            # device is commanded blindly on every evaluation, never confirms
+            # (so it will be suppressed as a failure), and can never create a
+            # manual-override lock, because the lock rule needs a readable
+            # at-target answer on both sides of the transition.
+            dev_key = getattr(device, "id", None)
+            if dev_key is None:
+                dev_key = getattr(device, "name", None)
+            if dev_key not in _unconfirmable_device_ids:
+                _unconfirmable_device_ids.add(dev_key)
+                logger.warning(
+                    f"Auto Lights cannot read the state of '{device.name}' "
+                    f"({type(device).__name__}): it exposes neither a "
+                    f"brightness attribute nor a 'brightness' state. It will "
+                    f"be commanded blindly, will never confirm, and can never "
+                    f"create a manual-override lock for its zone."
+                )
             result = False
     logger.log(5, f"_check_confirm result for '{device.name}': {result}")
     return result
 
 
-def is_device_at_target(device, desired_brightness) -> bool:
+def device_at_target_or_raise(device, desired_brightness) -> bool:
     """Return True if the given device is currently at the desired target.
 
     Accepts the same shape as the entries stored in zone.target_brightness
     (an int 0..100 or a bool). Wraps _check_confirm so callers don't have
     to translate between the int/bool target representations themselves.
+
+    Propagates any exception raised while reading the device. Use this one
+    where a false "not at target" would be harmful — the lock rule, where it
+    would silently mean "this device can never lock its zone". Where "not at
+    target" is the safe failure direction (the send path: command it; the
+    suppression recovery check: stay suppressed), is_device_at_target() is
+    the correct variant.
     """
     if isinstance(desired_brightness, bool):
         target_level = 100 if desired_brightness else 0
@@ -132,8 +176,17 @@ def is_device_at_target(device, desired_brightness) -> bool:
     else:
         target_level = int(desired_brightness)
         target_bool = None
+    return _check_confirm(device, target_level, target_bool)
+
+
+def is_device_at_target(device, desired_brightness) -> bool:
+    """Best-effort variant of device_at_target_or_raise().
+
+    A device that cannot be read at all is reported as "not at target",
+    which for the send path means "command it" — the safe direction there.
+    """
     try:
-        return _check_confirm(device, target_level, target_bool)
+        return device_at_target_or_raise(device, desired_brightness)
     except Exception:
         return False
 
