@@ -24,9 +24,9 @@ python3 /Users/mike/Mike_Sync_Documents/Programming/mike-local-development-scrip
 ```
 
 **Log Location**:
-- Indigo logs: `/Library/Application Support/Perceptive Automation/Indigo 2025.1/Logs`
-- Current day events: `/Library/Application Support/Perceptive Automation/Indigo 2025.1/Logs/YYYY-MM-DD Events.txt`
-- View recent logs: `tail -100 "/Library/Application Support/Perceptive Automation/Indigo 2025.1/Logs/$(date +%Y-%m-%d) Events.txt" | grep "Auto Lights"`
+- Indigo logs: `/Library/Application Support/Perceptive Automation/Indigo 2026.1/Logs`
+- Current day events: `/Library/Application Support/Perceptive Automation/Indigo 2026.1/Logs/YYYY-MM-DD Events.txt`
+- View recent logs: `tail -100 "/Library/Application Support/Perceptive Automation/Indigo 2026.1/Logs/$(date +%Y-%m-%d) Events.txt" | grep "Auto Lights"`
 
 **Web Configuration Access**:
 - URL: `http://localhost:8176/message/com.vtmikel.autolights/web_ui/`
